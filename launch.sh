@@ -335,20 +335,46 @@ if command -v xdg-mime >/dev/null 2>&1; then
   fi
 fi
 
-# Sandbox check: prefer Chromium sandbox when unprivileged user namespaces
-# are available. --no-sandbox is required on distros without userns support
-# (disables Chromium renderer process isolation — see security notes).
+# Sandbox detection: pick the best available mechanism in priority order.
+#   1. SUID chrome-sandbox (root:root 4755) — requires post-install setup as root
+#   2. User-namespace sandbox (--disable-setuid-sandbox) — userns + no AppArmor restriction
+#   3. --no-sandbox — renderer isolation disabled (Ubuntu 23.10+ AppArmor default)
 _sandbox_flag="--no-sandbox"
-if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
-  if [[ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" == "1" ]]; then
+
+# Locate chrome-sandbox: beside the binary (squashfs/system) or in npm dist dir
+_cs_beside="$(dirname "$ELECTRON_BIN")/chrome-sandbox"
+_cs_npm="$(dirname "$ELECTRON_BIN")/../lib/node_modules/electron/dist/chrome-sandbox"
+_CHROME_SANDBOX=""
+[[ -f "$_cs_beside" ]] && _CHROME_SANDBOX="$_cs_beside"
+[[ -z "$_CHROME_SANDBOX" && -f "$_cs_npm" ]] && _CHROME_SANDBOX="$(realpath "$_cs_npm" 2>/dev/null || echo "$_cs_npm")"
+
+if [[ -n "$_CHROME_SANDBOX" ]]; then
+  _cs_uid="$(stat -c '%u' "$_CHROME_SANDBOX" 2>/dev/null)"
+  _cs_mode="$(stat -c '%a' "$_CHROME_SANDBOX" 2>/dev/null)"
+  if [[ "$_cs_uid" == "0" && "$_cs_mode" == "4755" ]]; then
     _sandbox_flag=""
-    echo "User namespaces available — Chromium sandbox enabled"
+    echo "SUID sandbox configured — Chromium sandbox enabled"
   fi
-elif [[ -f /proc/sys/user/max_user_namespaces ]]; then
-  _max_ns="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null)"
-  if [[ "$_max_ns" -gt 0 ]] 2>/dev/null; then
-    _sandbox_flag=""
+fi
+
+if [[ "$_sandbox_flag" == "--no-sandbox" ]]; then
+  # Ubuntu 23.10+ AppArmor restricts unprivileged user namespaces even when the kernel
+  # allows them — check apparmor_restrict_unprivileged_userns before trusting userns.
+  _apparmor_restricts="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)"
+  _userns_ok=false
+  if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+    [[ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" == "1" ]] && _userns_ok=true
+  elif [[ -f /proc/sys/user/max_user_namespaces ]]; then
+    _max_ns="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null)"
+    [[ "${_max_ns:-0}" -gt 0 ]] 2>/dev/null && _userns_ok=true
+  fi
+  if [[ "$_userns_ok" == "true" && "$_apparmor_restricts" != "1" ]]; then
+    _sandbox_flag="--disable-setuid-sandbox"
     echo "User namespaces available — Chromium sandbox enabled"
+  else
+    [[ "$_apparmor_restricts" == "1" ]] \
+      && echo "AppArmor restricts user namespaces — using --no-sandbox (renderer isolation disabled)" \
+      || echo "No sandbox available — using --no-sandbox (renderer isolation disabled)"
   fi
 fi
 
